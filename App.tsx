@@ -630,8 +630,41 @@ const App: React.FC = () => {
             </nav>
             {isAdmin && <button onClick={handleLogout} className="p-2 text-slate-400 hover:text-red-400"><Unlock className="w-5 h-5" /></button>}
           </div>
-          <button className="md:hidden p-2 text-slate-300" onClick={() => setMobileMenuOpen(!mobileMenuOpen)}><Menu /></button>
+          <button className="md:hidden p-2 text-slate-300" onClick={() => setMobileMenuOpen(!mobileMenuOpen)}>
+             {mobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
+          </button>
         </div>
+
+        {/* Mobile Menu Dropdown */}
+        {mobileMenuOpen && (
+            <div className="md:hidden absolute top-16 left-0 w-full bg-slate-900 border-b border-slate-800 shadow-xl z-50 animate-in slide-in-from-top-5">
+                <nav className="flex flex-col p-4 space-y-2">
+                    <button onClick={() => switchTab(Tab.DASHBOARD)} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold ${activeTab === Tab.DASHBOARD ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}>
+                        <LayoutDashboard className="w-5 h-5" /> Dashboard
+                    </button>
+                    {isAdmin && (
+                        <button onClick={() => switchTab(Tab.AUCTION)} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold ${activeTab === Tab.AUCTION ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}>
+                            <Gavel className="w-5 h-5" /> Console
+                        </button>
+                    )}
+                    <button onClick={() => switchTab(Tab.ROSTER)} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold ${activeTab === Tab.ROSTER ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}>
+                        <Users className="w-5 h-5" /> Teams
+                    </button>
+                    <button onClick={() => switchTab(Tab.SETTINGS)} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold ${activeTab === Tab.SETTINGS ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}>
+                        {isAdmin ? <Settings className="w-5 h-5" /> : <Lock className="w-5 h-5" />} Settings
+                    </button>
+                    <div className="h-px bg-slate-800 my-2"></div>
+                    <button onClick={() => { setShowAboutModal(true); setMobileMenuOpen(false); }} className="flex items-center gap-3 px-4 py-3 text-slate-400 hover:bg-slate-800 rounded-xl text-sm font-bold">
+                        <Info className="w-5 h-5" /> About Initiative
+                    </button>
+                    {isAdmin && (
+                         <button onClick={() => { handleLogout(); setMobileMenuOpen(false); }} className="flex items-center gap-3 px-4 py-3 text-red-400 hover:bg-red-900/20 rounded-xl text-sm font-bold">
+                            <Unlock className="w-5 h-5" /> Logout Admin
+                         </button>
+                    )}
+                </nav>
+            </div>
+        )}
       </header>
 
       {/* Main */}
