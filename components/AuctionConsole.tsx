@@ -1,0 +1,710 @@
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { Player, TeamStats, ActivityLog, TournamentConfig } from '../types';
+import { Search, Gavel, Shuffle, Sparkles, X, ChevronRight, Lock, Ban, User, ArrowRight, Minus, Plus, Star, Scale, PenTool, CheckCircle, AlertTriangle, Clock, AlertOctagon, Wallet, Play, Target, Users, RefreshCw, Dice5 } from 'lucide-react';
+import PlayerImage from './PlayerImage';
+import { getSportColor, shuffleArray } from '../utils';
+
+interface AuctionConsoleProps {
+  players: Player[];
+  teams: TeamStats[];
+  onSellPlayer: (playerId: number, teamName: string, price: number) => void;
+  onUnsellPlayer: (playerId: number) => void;
+  onMarkUnsold: (playerId: number) => void;
+  onUpdatePlayer: (playerId: number, teamName: string, price: number) => void;
+  isReadOnly?: boolean;
+  currentPlayerId: string;
+  onSelectPlayer: (id: string) => void;
+  recentActivity: ActivityLog[];
+  config: TournamentConfig;
+  sports: string[];
+  categories: string[];
+}
+
+const AuctionConsole: React.FC<AuctionConsoleProps> = ({ 
+    players, teams, onSellPlayer, onUnsellPlayer, onMarkUnsold, onUpdatePlayer, isReadOnly = false,
+    currentPlayerId, onSelectPlayer, recentActivity, config, sports, categories
+}) => {
+  // --- EXISTING STATE ---
+  const [searchTerm, setSearchTerm] = useState("");
+  const [winningTeam, setWinningTeam] = useState("");
+  const [bidPrice, setBidPrice] = useState(config.basePrice);
+  const [error, setError] = useState<string | null>(null);
+  const [fairPlayError, setFairPlayError] = useState<string | null>(null);
+  const [overrideFairPlay, setOverrideFairPlay] = useState(false);
+  
+  // Correction Manager State
+  const [correctionSearch, setCorrectionSearch] = useState("");
+  const [correctionPlayerId, setCorrectionPlayerId] = useState<string>("");
+  const [correctionTeam, setCorrectionTeam] = useState("");
+  const [correctionPrice, setCorrectionPrice] = useState(0);
+
+  // --- RANDOMIZER / AUTO-FILL STATE ---
+  const [showRandomizer, setShowRandomizer] = useState(false);
+  const [randomizerMode, setRandomizerMode] = useState<'lucky' | 'targeted'>('lucky');
+  
+  // Mode 1: Lucky Draw State
+  const [rSport, setRSport] = useState<string>('all');
+  const [rGrade, setRGrade] = useState<string>('all');
+  const [poolSource, setPoolSource] = useState<'available' | 'unsold'>('available');
+  const [isSpinning, setIsSpinning] = useState(false);
+  const [spinName, setSpinName] = useState("Ready?");
+  const [spinWinner, setSpinWinner] = useState<Player | null>(null);
+  const [selectionOrigin, setSelectionOrigin] = useState<'randomizer' | 'manual'>('manual');
+
+  // Mode 2: Targeted Fill State
+  const [targetFillTeam, setTargetFillTeam] = useState("");
+  const [fillRequests, setFillRequests] = useState<Record<string, number>>({});
+  // Updated batchPreview structure to hold list of covered sports
+  const [batchPreview, setBatchPreview] = useState<{player: Player, covered: string[]}[] | null>(null);
+  const [batchError, setBatchError] = useState<string | null>(null);
+  const [targetPoolType, setTargetPoolType] = useState<'LIVE' | 'LOTTERY'>('LIVE');
+
+  // Post-Sale Overlay
+  const [lastSale, setLastSale] = useState<{player: Player, team: string, price: number, remainingPurse: number} | null>(null);
+
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // --- EFFECTS ---
+  useEffect(() => { return () => { if (timerRef.current) clearTimeout(timerRef.current); }; }, []);
+  useEffect(() => { if (!isReadOnly) setBidPrice(config.basePrice); }, [config.basePrice, currentPlayerId, isReadOnly]);
+
+  // Derived State
+  const selectedPlayer = useMemo(() => players.find(p => p.id.toString() === currentPlayerId), [currentPlayerId, players]);
+  const unsoldPlayers = useMemo(() => players.filter(p => !p.team && p.status !== 'sold' && p.name.toLowerCase().includes(searchTerm.toLowerCase())), [players, searchTerm]);
+  const soldPlayers = useMemo(() => correctionSearch ? players.filter(p => p.team && p.name.toLowerCase().includes(correctionSearch.toLowerCase())) : [], [players, correctionSearch]);
+  
+  const recentlySoldList = useMemo(() => {
+    const list: Player[] = [];
+    const ids = new Set<string>();
+    recentActivity.forEach(log => {
+        if (log.type === 'sale' && log.details?.playerName) {
+            const p = players.find(pl => pl.name === log.details!.playerName && pl.team);
+            if (p && !ids.has(p.name)) { list.push(p); ids.add(p.name); }
+        }
+    });
+    return list.slice(0, 10);
+  }, [recentActivity, players]);
+
+  // --- TARGETED FILL HELPERS ---
+  const selectedTargetTeamData = useMemo(() => teams.find(t => t.name === targetFillTeam), [targetFillTeam, teams]);
+
+  const handlePreviewBatch = () => {
+      if (!targetFillTeam) { setBatchError("Please select a team first."); return; }
+      setBatchError(null);
+
+      // 1. Get Shuffled Pool
+      const availablePool = shuffleArray<Player>(
+          players.filter(p => 
+            !p.team && 
+            (p.status === 'available' || p.status === 'unsold') &&
+            p.auctionType === targetPoolType // Strict Filter
+          )
+      );
+      
+      const selectedBatch: {player: Player, covered: string[]}[] = [];
+      const usedIds = new Set<number>();
+      
+      // Clone requests to decrement as we find players
+      const remainingRequests: Record<string, number> = { ...fillRequests };
+
+      // Helper: Check if we still need players
+      const hasNeeds = () => Object.values(remainingRequests).some((val) => (val as number) > 0);
+
+      // Loop until all needs are met or pool is exhausted
+      let safetyCounter = 0;
+      const MAX_LOOPS = availablePool.length + 10; 
+
+      while (hasNeeds() && safetyCounter < MAX_LOOPS) {
+          safetyCounter++;
+
+          // Identify currently needed sports
+          const neededSports = Object.keys(remainingRequests).filter(s => (remainingRequests[s] as number) > 0);
+
+          // Find a candidate who plays AT LEAST ONE of the needed sports
+          const candidateIndex = availablePool.findIndex(p => 
+              !usedIds.has(p.id) && 
+              neededSports.some(s => p.ratings[s] && p.ratings[s] !== '0')
+          );
+
+          if (candidateIndex === -1) {
+              // No matching players left for remaining needs
+              break; 
+          }
+
+          const candidate = availablePool[candidateIndex];
+          usedIds.add(candidate.id);
+
+          // SMART DEDUCTION:
+          // Check ALL sports this player plays. If we needed it, decrement.
+          const coveredByThisPlayer: string[] = [];
+          
+          sports.forEach(s => {
+              if (candidate.ratings[s] && candidate.ratings[s] !== '0') {
+                  coveredByThisPlayer.push(s);
+                  // If we specifically needed this sport, mark it off
+                  if ((remainingRequests[s] as number) > 0) {
+                      remainingRequests[s]--;
+                  }
+              }
+          });
+
+          selectedBatch.push({ player: candidate, covered: coveredByThisPlayer });
+      }
+
+      if (selectedBatch.length === 0) {
+          setBatchError(`No eligible ${targetPoolType} players found.`);
+          return;
+      }
+      
+      setBatchPreview(selectedBatch);
+  };
+
+  const handleConfirmBatch = () => {
+      if (!batchPreview || !targetFillTeam) return;
+      
+      // Execute Sales sequentially
+      batchPreview.forEach(item => {
+          onSellPlayer(item.player.id, targetFillTeam, config.basePrice);
+      });
+
+      // Reset
+      setBatchPreview(null);
+      setFillRequests({});
+      setBatchError(null);
+  };
+
+
+  // --- LUCKY DRAW HELPERS ---
+  const eligibleRandomPlayers = useMemo(() => {
+     return players.filter(p => {
+         // Pool Source Filter
+         if (poolSource === 'available' && p.status !== 'available') return false;
+         if (poolSource === 'unsold' && p.status !== 'unsold') return false;
+         if (p.team) return false; // Safety check
+         
+         // STRICT LIVE FILTER: Lucky Draw is for Auction only
+         if (p.auctionType !== 'LIVE') return false;
+
+         // Sport/Grade Filter
+         if (rSport !== 'all' && (!p.ratings[rSport] || p.ratings[rSport] === '0')) return false;
+         if (rGrade !== 'all') {
+             if (rSport === 'all') return Object.values(p.ratings).includes(rGrade);
+             return p.ratings[rSport] === rGrade;
+         }
+         return true;
+     });
+  }, [players, rSport, rGrade, poolSource]);
+
+  const handleSpin = () => {
+    if (eligibleRandomPlayers.length === 0) return;
+    setIsSpinning(true); setSpinWinner(null);
+    let speed = 50, counter = 0;
+    const run = () => {
+        const candidate = eligibleRandomPlayers[Math.floor(Math.random() * eligibleRandomPlayers.length)];
+        setSpinName(candidate.name);
+        counter++;
+        if (counter < 25) {
+             if (counter > 15) speed += 40;
+             timerRef.current = setTimeout(run, speed);
+        } else {
+             setSpinWinner(candidate); setIsSpinning(false);
+        }
+    };
+    run();
+  };
+
+  // --- VALIDATION & SALE LOGIC ---
+  
+  // Dynamic Fair Play & Squad Composition Check (Single Sale)
+  useEffect(() => {
+      setFairPlayError(null);
+      setOverrideFairPlay(false);
+      if (selectedPlayer && winningTeam) {
+          const targetTeam = teams.find(t => t.name === winningTeam);
+          if (targetTeam) {
+              // 1. Check Max Sport Limits
+              for (const sport of sports) {
+                  if (selectedPlayer.ratings[sport] && selectedPlayer.ratings[sport] !== '0') {
+                      const limit = config.sportLimits?.[sport]?.max || 999;
+                      const currentCount = targetTeam.sportStats[sport]?.total || 0;
+                      if (currentCount >= limit) {
+                           setFairPlayError(`🚫 MAX SQUAD LIMIT: ${winningTeam} already has ${currentCount} ${sport} players (Max ${limit}).`);
+                           return; 
+                      }
+                  }
+              }
+              // 2. Check Fair Play Quotas (Category Limits)
+              if (config.categoryLimits) {
+                for (const sport of sports) {
+                    const rating = selectedPlayer.ratings[sport];
+                    if (rating && rating !== '0' && config.categoryLimits[sport]) {
+                        const limit = config.categoryLimits[sport][rating];
+                        const currentCount = targetTeam.sportStats[sport]?.categoryCounts[rating] || 0;
+                        if (currentCount >= limit) {
+                            const othersLagging = teams.filter(t => t.name !== winningTeam).some(t => (t.sportStats[sport]?.categoryCounts[rating] || 0) < limit);
+                            if (othersLagging) {
+                                setFairPlayError(`⚠️ FAIR PLAY QUOTA: All teams must have ${limit} Grade '${rating}' players before you can buy more.`);
+                                return;
+                            }
+                        }
+                    }
+                }
+              }
+          }
+      }
+  }, [winningTeam, selectedPlayer, teams, config, sports]);
+
+  const selectedCorrectionPlayer = useMemo(() => players.find(p => p.id.toString() === correctionPlayerId), [correctionPlayerId, players]);
+  useEffect(() => {
+      if (selectedCorrectionPlayer?.team) {
+          setCorrectionTeam(selectedCorrectionPlayer.team);
+          setCorrectionPrice(selectedCorrectionPlayer.price);
+      }
+  }, [selectedCorrectionPlayer]);
+
+  const handleSell = () => {
+    if (isReadOnly || !selectedPlayer || !winningTeam) { setError("Select team."); return; }
+    const team = teams.find(t => t.name === winningTeam);
+    if (!team) return;
+    if (team.playerCount >= config.maxSquadSize) { setError("Team Full!"); return; }
+    
+    // Check Budget with Reserve
+    const emptySlots = Math.max(0, config.maxSquadSize - team.playerCount - 1); // -1 for current
+    const reserve = emptySlots * config.basePrice;
+    const maxBid = team.availableBalance - reserve;
+
+    if (bidPrice > maxBid) { setError(`Insufficient Funds. Max Bid: ${maxBid}`); return; }
+
+    // Execute Sale
+    onSellPlayer(selectedPlayer.id, winningTeam, bidPrice);
+
+    // Show Summary Overlay
+    setLastSale({
+        player: selectedPlayer,
+        team: winningTeam,
+        price: bidPrice,
+        remainingPurse: team.disposableBalance - bidPrice
+    });
+    setError(null);
+  };
+
+  const handlePostSaleContinue = () => {
+      setLastSale(null);
+      onSelectPlayer(""); 
+      setWinningTeam(""); 
+      setBidPrice(config.basePrice); 
+      
+      if (selectionOrigin === 'randomizer') { 
+          setShowRandomizer(true); 
+          setSpinWinner(null); 
+          setSpinName("Ready?"); 
+      }
+  };
+
+  const handleMarkUnsoldAction = () => {
+      if (!selectedPlayer) return;
+      onMarkUnsold(selectedPlayer.id);
+      onSelectPlayer(""); setWinningTeam(""); setBidPrice(config.basePrice); setError(null);
+      if (selectionOrigin === 'randomizer') { setShowRandomizer(true); setSpinWinner(null); setSpinName("Ready?"); }
+  }
+
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-[calc(100vh-140px)] min-h-[700px]">
+      
+      {/* SIDEBAR */}
+      <div className="lg:col-span-3 flex flex-col gap-4 bg-slate-900 p-4 rounded-2xl border border-slate-800 h-full overflow-hidden shadow-xl lg:order-1 order-2">
+        {!isReadOnly && <button onClick={() => { setShowRandomizer(true); onSelectPlayer(""); setSpinWinner(null); setLastSale(null); setBatchPreview(null); }} className="w-full py-4 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 text-white rounded-xl font-bold flex justify-center gap-2 shadow-lg shadow-indigo-900/30 transition-all"><Sparkles className="w-5 h-5" /> Automation Hub</button>}
+        <div className="relative"><Search className="absolute left-3 top-3.5 h-5 w-5 text-slate-500" /><input type="text" placeholder="Search..." className="w-full pl-10 pr-4 py-3 bg-slate-950 border border-slate-800 rounded-xl text-white focus:outline-none" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} /></div>
+        <div className="flex-1 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+            {unsoldPlayers.map(p => (
+              <button key={p.id} onClick={() => { onSelectPlayer(p.id.toString()); setSelectionOrigin('manual'); setShowRandomizer(false); setError(null); setLastSale(null); }} className={`w-full text-left px-4 py-3 rounded-xl border flex justify-between ${currentPlayerId === p.id.toString() ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-800/50 border-slate-800 text-slate-200'}`}>
+                <div>
+                    <span className="font-bold text-sm block">{p.name}</span>
+                    <span className="text-[10px] opacity-60 flex gap-2">
+                        <span>#{p.id}</span>
+                        {p.status === 'unsold' && <span className="text-amber-400 font-bold">Unsold</span>}
+                        {p.auctionType === 'LOTTERY' && <span className="text-blue-400 font-bold flex items-center gap-1"><Dice5 className="w-3 h-3"/> Lottery</span>}
+                    </span>
+                </div>
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            ))}
+        </div>
+      </div>
+
+      {/* MAIN AREA */}
+      <div className="lg:col-span-9 h-full flex flex-col relative lg:order-2 order-1 min-h-[500px]">
+        
+        {/* VIEW LOGIC: 1. Randomizer/Targeted -> 2. Sale Summary -> 3. Selected Player -> 4. Empty State */}
+        
+        {showRandomizer ? (
+            <div className="h-full bg-slate-900 rounded-2xl border border-slate-700 flex flex-col relative overflow-hidden">
+                {/* Header / Tabs */}
+                <div className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900 z-20">
+                    <div className="flex bg-slate-800 p-1 rounded-lg">
+                        <button onClick={() => setRandomizerMode('lucky')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 transition-all ${randomizerMode === 'lucky' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`}>
+                            <Shuffle className="w-4 h-4" /> Lucky Draw
+                        </button>
+                        <button onClick={() => setRandomizerMode('targeted')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 transition-all ${randomizerMode === 'targeted' ? 'bg-emerald-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`}>
+                            <Target className="w-4 h-4" /> Targeted Fill
+                        </button>
+                    </div>
+                    <button onClick={() => setShowRandomizer(false)}><X className="text-slate-400 hover:text-white" /></button>
+                </div>
+
+                {/* MODE 1: LUCKY DRAW */}
+                {randomizerMode === 'lucky' && (
+                    <div className="flex-1 flex flex-col items-center justify-center p-6 relative animate-in fade-in zoom-in-95">
+                        <div className="flex gap-4 mb-8 z-10 flex-wrap justify-center">
+                            <select value={poolSource} onChange={(e) => setPoolSource(e.target.value as any)} disabled={isSpinning} className="bg-slate-800 border-slate-700 text-white rounded px-4 py-2 font-bold"><option value="available">Fresh Pool (Live)</option><option value="unsold">Unsold Pool (Live)</option></select>
+                            <select value={rSport} onChange={(e) => setRSport(e.target.value)} disabled={isSpinning} className="bg-slate-800 border-slate-700 text-white rounded px-4 py-2"><option value="all">All Sports</option>{sports.map(s => <option key={s} value={s}>{s}</option>)}</select>
+                            <select value={rGrade} onChange={(e) => setRGrade(e.target.value)} disabled={isSpinning} className="bg-slate-800 border-slate-700 text-white rounded px-4 py-2"><option value="all">Any Grade</option>{categories.map(c => <option key={c} value={c}>Grade {c}</option>)}</select>
+                        </div>
+                        <div className="mb-16 text-center z-10 w-full min-h-[200px] flex items-center justify-center">
+                            {spinWinner ? (
+                                <div className="animate-in zoom-in">
+                                    <div className="text-emerald-400 font-bold tracking-widest uppercase mb-4 animate-pulse">Winner</div>
+                                    <h1 className="text-6xl md:text-8xl font-black text-white mb-8">{spinWinner.name}</h1>
+                                    <div className="flex justify-center gap-3">
+                                        {sports.map((s, i) => {
+                                            const r = spinWinner.ratings[s];
+                                            if(!r || r==='0') return null;
+                                            return <span key={s} className={`px-4 py-1 rounded-full font-bold text-sm text-white ${getSportColor(i).bg}`}>{s}: {r}</span>
+                                        })}
+                                    </div>
+                                </div>
+                            ) : eligibleRandomPlayers.length === 0 ? (
+                                <div className="text-slate-500 text-2xl font-bold">No LIVE players found in {poolSource} pool.</div>
+                            ) : (
+                                <h1 className="text-6xl md:text-9xl font-black text-slate-800">{spinName}</h1>
+                            )}
+                        </div>
+                        <div className="z-10 h-20">
+                            {spinWinner ? (
+                                <button onClick={() => { onSelectPlayer(spinWinner.id.toString()); setSelectionOrigin('randomizer'); setShowRandomizer(false); }} className="px-10 py-4 bg-emerald-600 text-white rounded-full font-bold text-xl flex items-center gap-3">Start Bidding <ArrowRight /></button>
+                            ) : (
+                                <button onClick={handleSpin} disabled={isSpinning || eligibleRandomPlayers.length === 0} className="px-16 py-6 bg-indigo-600 text-white rounded-full font-black text-2xl flex items-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed">{isSpinning ? '...' : 'SPIN'}</button>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {/* MODE 2: TARGETED FILL */}
+                {randomizerMode === 'targeted' && (
+                    <div className="flex-1 overflow-y-auto p-8 animate-in fade-in slide-in-from-right-4">
+                        {!batchPreview ? (
+                            <div className="max-w-4xl mx-auto">
+                                <h3 className="text-2xl font-black text-white mb-6">Targeted Team Filler</h3>
+                                
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                                    {/* 1. SELECT TEAM */}
+                                    <div className="bg-slate-950 p-6 rounded-2xl border border-slate-800">
+                                        <div className="mb-4">
+                                            <label className="text-xs font-bold text-slate-500 uppercase mb-2 block">Pool Source</label>
+                                            <div className="flex gap-2">
+                                                <button onClick={() => setTargetPoolType('LIVE')} className={`flex-1 py-2 rounded text-sm font-bold flex items-center justify-center gap-2 ${targetPoolType === 'LIVE' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400'}`}>
+                                                    <Gavel className="w-4 h-4"/> Live Auction
+                                                </button>
+                                                <button onClick={() => setTargetPoolType('LOTTERY')} className={`flex-1 py-2 rounded text-sm font-bold flex items-center justify-center gap-2 ${targetPoolType === 'LOTTERY' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'}`}>
+                                                    <Dice5 className="w-4 h-4"/> Lottery/Draft
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <label className="text-xs font-bold text-slate-500 uppercase mb-3 block">Select Target Team</label>
+                                        <div className="grid grid-cols-2 gap-3 max-h-[350px] overflow-y-auto custom-scrollbar pr-2">
+                                            {teams.map(t => (
+                                                <button 
+                                                    key={t.name}
+                                                    onClick={() => setTargetFillTeam(t.name)}
+                                                    className={`p-4 rounded-xl border text-left transition-all ${targetFillTeam === t.name ? 'bg-emerald-600 border-emerald-500 text-white ring-2 ring-emerald-500/30' : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-white'}`}
+                                                >
+                                                    <div className="font-bold">{t.name}</div>
+                                                    <div className="text-xs opacity-70 mt-1">{t.playerCount}/{config.maxSquadSize} Players</div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* 2. DEFICIT DASHBOARD & INPUTS */}
+                                    <div className="space-y-6">
+                                        {selectedTargetTeamData ? (
+                                            <div className="bg-slate-950 p-6 rounded-2xl border border-slate-800">
+                                                <h4 className="font-bold text-white mb-4 flex items-center gap-2"><Users className="w-5 h-5 text-emerald-400" /> {selectedTargetTeamData.name} Needs</h4>
+                                                
+                                                <div className="space-y-4">
+                                                    {sports.map((sport, i) => {
+                                                        const stats = selectedTargetTeamData.sportStats[sport] || { total: 0 };
+                                                        const min = config.sportLimits[sport]?.min || 0;
+                                                        const deficit = Math.max(0, min - stats.total);
+                                                        const colors = getSportColor(i);
+
+                                                        return (
+                                                            <div key={sport} className="flex items-center justify-between gap-4 bg-slate-900 p-3 rounded-xl border border-slate-800">
+                                                                <div className="flex-1">
+                                                                    <div className={`font-bold ${colors.text} text-sm uppercase`}>{sport}</div>
+                                                                    <div className="text-xs flex gap-2 mt-1">
+                                                                        <span className="text-slate-400">Current: <span className="text-white font-mono">{stats.total}</span></span>
+                                                                        <span className={`${deficit > 0 ? 'text-red-400' : 'text-emerald-400'} font-bold`}>
+                                                                            {deficit > 0 ? `Need ${deficit} more` : 'Min Met'}
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
+
+                                                                {/* REQUEST INPUT */}
+                                                                <div className="flex items-center gap-3 bg-slate-950 rounded-lg p-1 border border-slate-700">
+                                                                    <button 
+                                                                        onClick={() => setFillRequests(prev => ({ ...prev, [sport]: Math.max(0, (prev[sport]||0) - 1) }))}
+                                                                        className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded"
+                                                                    ><Minus className="w-4 h-4" /></button>
+                                                                    <span className="w-6 text-center font-bold text-white">{fillRequests[sport] || 0}</span>
+                                                                    <button 
+                                                                        onClick={() => setFillRequests(prev => ({ ...prev, [sport]: (prev[sport]||0) + 1 }))}
+                                                                        className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded"
+                                                                    ><Plus className="w-4 h-4" /></button>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+
+                                                {batchError && <div className="mt-4 text-red-400 text-sm font-bold text-center bg-red-900/20 p-2 rounded">{batchError}</div>}
+
+                                                <button 
+                                                    onClick={handlePreviewBatch}
+                                                    disabled={(Object.values(fillRequests) as number[]).reduce((a, b) => a+b, 0) === 0}
+                                                    className="w-full mt-6 py-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-bold flex items-center justify-center gap-2"
+                                                >
+                                                    <Play className="w-4 h-4 fill-current" /> Preview {targetPoolType} Batch
+                                                </button>
+                                            </div>
+                                        ) : (
+                                            <div className="h-full flex flex-col items-center justify-center text-slate-600 border-2 border-dashed border-slate-800 rounded-2xl">
+                                                <Target className="w-12 h-12 mb-2 opacity-50" />
+                                                <p className="font-bold">Select a team to see deficits</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            // BATCH PREVIEW MODAL (INLINE)
+                            <div className="max-w-3xl mx-auto bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
+                                <div className="bg-slate-900 p-4 border-b border-slate-800 flex items-center justify-between">
+                                    <h3 className="font-black text-white text-lg flex items-center gap-2"><Sparkles className="text-amber-400" /> Confirm Batch Assignment</h3>
+                                    <div className="text-sm font-bold text-slate-400">Target: <span className="text-emerald-400">{targetFillTeam}</span> ({targetPoolType})</div>
+                                </div>
+                                <div className="max-h-[400px] overflow-y-auto">
+                                    <table className="w-full text-left text-sm">
+                                        <thead className="bg-slate-900 text-slate-500 uppercase text-xs font-bold sticky top-0">
+                                            <tr>
+                                                <th className="p-4">Player</th>
+                                                <th className="p-4">Sports Covered</th>
+                                                <th className="p-4 text-right">Price</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-800">
+                                            {batchPreview.map((item, idx) => (
+                                                <tr key={idx}>
+                                                    <td className="p-4 font-bold text-white">{item.player.name}</td>
+                                                    <td className="p-4">
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {item.covered.map(s => {
+                                                                // Highlight requested sports
+                                                                const isRequested = fillRequests[s] > 0;
+                                                                const rating = item.player.ratings[s];
+                                                                return (
+                                                                    <span 
+                                                                        key={s} 
+                                                                        className={`px-2 py-1 rounded text-xs font-bold border ${isRequested ? 'bg-emerald-900/30 text-emerald-400 border-emerald-500/30' : 'bg-slate-800 text-slate-500 border-slate-700'}`}
+                                                                    >
+                                                                        {s} ({rating})
+                                                                    </span>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    </td>
+                                                    <td className="p-4 text-right font-mono text-emerald-400">{config.basePrice}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div className="p-4 border-t border-slate-800 bg-slate-900 flex gap-3">
+                                    <button onClick={() => setBatchPreview(null)} className="flex-1 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800">Cancel</button>
+                                    <button onClick={handleConfirmBatch} className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold flex items-center justify-center gap-2">
+                                        <CheckCircle className="w-5 h-5" /> Confirm & Assign ({batchPreview.length})
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        ) : lastSale ? (
+            /* SALE SUMMARY OVERLAY */
+            <div className="h-full flex flex-col items-center justify-center bg-slate-900 rounded-3xl border border-slate-700 p-8 animate-in zoom-in-95 duration-300 relative overflow-hidden">
+                <div className="absolute top-0 left-0 w-full h-2 bg-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.5)]"></div>
+                <div className="text-center z-10">
+                    <h1 className="text-6xl md:text-8xl font-black text-emerald-500 mb-2 drop-shadow-2xl tracking-tighter">SOLD!</h1>
+                    <div className="text-4xl md:text-6xl text-white font-bold mb-8">{lastSale.player.name}</div>
+                    
+                    <div className="bg-slate-800 p-8 rounded-3xl border border-slate-700 w-full max-w-xl mx-auto space-y-6 shadow-2xl">
+                        <div className="flex justify-between items-center border-b border-slate-700 pb-4">
+                            <span className="text-slate-400 uppercase font-bold text-sm tracking-widest">Sold To</span>
+                            <span className="text-indigo-400 font-black text-3xl">{lastSale.team}</span>
+                        </div>
+                        <div className="flex justify-between items-center border-b border-slate-700 pb-4">
+                            <span className="text-slate-400 uppercase font-bold text-sm tracking-widest">Price</span>
+                            <span className="text-white font-black text-4xl font-mono">₹{lastSale.price}</span>
+                        </div>
+                        <div className="pt-2">
+                            <div className="flex justify-between items-center bg-emerald-900/20 p-4 rounded-xl border border-emerald-500/30">
+                                <div className="flex items-center gap-2 text-emerald-400">
+                                    <Wallet className="w-5 h-5" />
+                                    <span className="text-xs uppercase font-bold tracking-wider">New Purse Balance</span>
+                                </div>
+                                <span className="text-emerald-300 font-mono font-black text-2xl">₹{lastSale.remainingPurse}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="flex gap-4 mt-12 justify-center">
+                        <button onClick={handlePostSaleContinue} className="px-8 py-4 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-bold text-lg flex items-center gap-2 transition-all">
+                            Continue <ChevronRight className="w-5 h-5" />
+                        </button>
+                        {selectionOrigin === 'randomizer' && randomizerMode === 'lucky' && (
+                            <button onClick={handlePostSaleContinue} className="px-8 py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-lg flex items-center gap-2 shadow-lg shadow-indigo-500/20 transition-all">
+                                <Shuffle className="w-5 h-5" /> Next Spin
+                            </button>
+                        )}
+                        {selectionOrigin === 'randomizer' && randomizerMode === 'targeted' && (
+                            <button onClick={handlePostSaleContinue} className="px-8 py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-lg flex items-center gap-2 shadow-lg shadow-emerald-500/20 transition-all">
+                                <Target className="w-5 h-5" /> Fill More
+                            </button>
+                        )}
+                    </div>
+                </div>
+            </div>
+        ) : selectedPlayer ? (
+          <div className="h-full flex flex-col gap-4 animate-in slide-in-from-bottom-8">
+            {/* HERO CARD */}
+            <div className="flex-[2] bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl border border-slate-700 p-6 relative flex items-center justify-center">
+               <button onClick={() => onSelectPlayer("")} className="absolute top-4 right-4 p-2 text-slate-500 hover:text-white"><X /></button>
+               <div className="w-full max-w-5xl flex flex-col md:flex-row items-center gap-12">
+                   <div className="w-64 h-64 rounded-2xl border-4 border-slate-600/50 overflow-hidden bg-slate-800 relative shadow-2xl">
+                        <PlayerImage name={selectedPlayer.name} className="w-full h-full object-cover" />
+                   </div>
+                   <div className="flex-1 text-center md:text-left space-y-4">
+                        <div>
+                            <div className={`inline-block px-3 py-1 text-xs font-bold uppercase rounded-full mb-2 ${selectedPlayer.status === 'unsold' ? 'bg-amber-900/50 text-amber-400' : 'bg-slate-700/50 text-slate-400'}`}>
+                                {selectedPlayer.status === 'unsold' ? 'Re-Auctioning (Unsold)' : 'Now Auctioning'}
+                            </div>
+                            {selectedPlayer.auctionType === 'LOTTERY' && (
+                                <div className="inline-block px-3 py-1 text-xs font-bold uppercase rounded-full mb-2 ml-2 bg-blue-900/50 text-blue-400 border border-blue-500/30">
+                                    LOTTERY TIER
+                                </div>
+                            )}
+                            <h1 className="text-6xl font-black text-white leading-tight">{selectedPlayer.name}</h1>
+                        </div>
+                        <div className="flex flex-wrap justify-center md:justify-start gap-3">
+                           {sports.map((sport, i) => {
+                               const rating = selectedPlayer.ratings[sport];
+                               if (!rating || rating === '0') return null;
+                               const colors = getSportColor(i);
+                               return <div key={sport} className={`px-4 py-2 rounded-xl border-2 text-lg font-black uppercase shadow-lg ${colors.bg} ${colors.border} text-white`}>{sport}: {rating}</div>
+                           })}
+                        </div>
+                        <div className="pt-2"><span className="text-slate-400 text-sm uppercase font-bold">Base Price</span><div className="text-3xl font-mono font-black text-emerald-400">{config.basePrice}</div></div>
+                   </div>
+               </div>
+            </div>
+
+            {/* CONTROLS */}
+            <div className="flex-1 bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-xl flex flex-col justify-center">
+                {error && <div className="mb-4 p-3 bg-red-900/30 text-red-200 rounded-lg text-center font-bold">{error}</div>}
+                {fairPlayError && <div className="mb-4 p-4 bg-amber-900/20 text-amber-100 rounded-lg flex gap-3"><Scale className="text-amber-500" /><div><p className="font-bold text-sm">{fairPlayError}</p><label className="flex gap-2 mt-2 cursor-pointer"><input type="checkbox" checked={overrideFairPlay} onChange={e => setOverrideFairPlay(e.target.checked)} /><span className="text-xs font-bold text-amber-400 uppercase">Override Rule</span></label></div></div>}
+                
+                {!isReadOnly ? (
+                    <div className="flex flex-col md:flex-row items-end gap-4 h-full">
+                        <div className="w-full md:flex-[2] h-full flex flex-col">
+                            <label className="text-xs font-bold text-slate-500 uppercase mb-2">Team</label>
+                            <div className="flex-1 grid grid-cols-2 lg:grid-cols-3 gap-2 overflow-y-auto max-h-[160px] custom-scrollbar">
+                                {teams.map(t => (
+                                    <button key={t.name} onClick={() => setWinningTeam(t.name)} disabled={t.disposableBalance <= 0} className={`p-3 rounded-xl border text-left ${winningTeam === t.name ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'} ${t.disposableBalance<=0?'opacity-50':''}`}>
+                                        <div className="font-bold text-sm truncate">{t.name}</div><div className="text-xs font-mono opacity-80">${t.disposableBalance}</div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                        <div className="w-full md:flex-1">
+                            <label className="text-xs font-bold text-slate-500 uppercase mb-2">Bid</label>
+                            <div className="flex h-[88px]"><button onClick={() => setBidPrice(p => Math.max(0, p-5))} className="px-3 bg-slate-800 border border-slate-700 rounded-l-2xl text-slate-300"><Minus /></button><input type="number" className="w-full bg-slate-950 border-y border-slate-700 text-center text-white text-4xl font-black" value={bidPrice} onChange={e => setBidPrice(parseInt(e.target.value)||0)} /><button onClick={() => setBidPrice(p => p+5)} className="px-3 bg-slate-800 border border-slate-700 rounded-r-2xl text-slate-300"><Plus /></button></div>
+                        </div>
+                        <div className="w-full md:flex-1 flex gap-2 h-[88px]">
+                             <button onClick={() => { onSelectPlayer(""); setWinningTeam(""); }} className="aspect-square bg-slate-800 border-2 border-slate-700 text-slate-400 hover:text-red-400 rounded-2xl flex flex-col items-center justify-center"><Ban /><span className="text-[10px] font-bold">PASS</span></button>
+                             <div className="flex-1 flex flex-col gap-2 h-full">
+                                <button onClick={handleSell} disabled={!!fairPlayError && !overrideFairPlay} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-black text-xl flex items-center justify-center gap-2 shadow-lg shadow-emerald-900/20"><Gavel className="w-5 h-5" /> SOLD</button>
+                                <button onClick={handleMarkUnsoldAction} className="h-10 bg-amber-600 hover:bg-amber-500 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-900/20"><AlertOctagon className="w-4 h-4" /> MARK UNSOLD</button>
+                             </div>
+                        </div>
+                    </div>
+                ) : <div className="text-center opacity-50"><Gavel className="w-16 h-16 mx-auto mb-4" /><h3>Waiting for Auctioneer</h3></div>}
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 bg-slate-900/50 rounded-3xl border border-slate-800/50 flex flex-col items-center justify-center text-slate-600">
+              <div className="w-32 h-32 bg-slate-800 rounded-full flex items-center justify-center mb-6"><Gavel className="w-12 h-12" /></div>
+              <h2 className="text-3xl font-black text-slate-700">Ready</h2>
+          </div>
+        )}
+
+        {/* CORRECTION MANAGER */}
+        {!isReadOnly && (
+            <div className="mt-6 bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                <details className="group">
+                    <summary className="flex items-center gap-2 cursor-pointer font-bold text-slate-500 hover:text-white"><PenTool className="w-4 h-4" /> Correction Manager</summary>
+                    <div className="pt-4 mt-4 border-t border-slate-800 space-y-4">
+                        <div className="flex gap-4">
+                            <select className="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-white text-sm" onChange={e => setCorrectionPlayerId(e.target.value)} value={correctionPlayerId}><option value="">Recently Sold</option>{recentlySoldList.map(p => <option key={p.id} value={p.id}>{p.name} ({p.team})</option>)}</select>
+                            <input type="text" placeholder="Search sold players..." className="flex-1 bg-slate-950 border border-slate-700 rounded px-3 py-2 text-white text-sm" value={correctionSearch} onChange={e => { setCorrectionSearch(e.target.value); setCorrectionPlayerId(""); }} />
+                        </div>
+                        {correctionSearch && !correctionPlayerId && (
+                            <div className="bg-slate-800 p-2 rounded max-h-32 overflow-y-auto">{soldPlayers.map(p => <div key={p.id} onClick={() => { setCorrectionPlayerId(p.id.toString()); setCorrectionSearch(""); }} className="p-2 hover:bg-slate-700 cursor-pointer text-sm text-slate-300">{p.name} ({p.team})</div>)}</div>
+                        )}
+                        {selectedCorrectionPlayer && (
+                            <div className="bg-indigo-900/20 border border-indigo-500/30 p-3 rounded flex justify-between items-center">
+                                <div><div className="text-xs text-slate-400 font-bold uppercase">Editing</div><div className="font-black text-white">{selectedCorrectionPlayer.name}</div></div>
+                                <div className="flex gap-2">
+                                    <select className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white text-sm" value={correctionTeam} onChange={e => setCorrectionTeam(e.target.value)}>{teams.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}</select>
+                                    <input 
+                                        type="number" 
+                                        className="w-20 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white text-sm" 
+                                        value={correctionPrice} 
+                                        onChange={e => setCorrectionPrice(parseInt(e.target.value) || 0)} 
+                                    />
+                                    <button onClick={() => { onUpdatePlayer(parseInt(correctionPlayerId), correctionTeam, correctionPrice); setCorrectionPlayerId(""); }} className="bg-indigo-600 px-3 rounded text-white text-xs font-bold">Save</button>
+                                    <button 
+                                        onClick={() => { 
+                                            if (confirm("Revert this sale? This will refund the purse and reset the player.")) { 
+                                                onUnsellPlayer(parseInt(correctionPlayerId)); 
+                                                setCorrectionPlayerId(""); 
+                                            } 
+                                        }} 
+                                        className="bg-red-600 px-3 rounded text-white text-xs font-bold"
+                                    >
+                                        Unsell
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </details>
+            </div>
+        )}
+      </div>
+    </div>
+  );
+};
+export default AuctionConsole;
